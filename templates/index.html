@@ -52,17 +52,27 @@
     <section class="feed-panel glass-card">
       <div class="feed-header">
         <h2><span class="pulse-dot"></span> Live Camera Feed</h2>
-        <span class="feed-badge">MJPEG STREAM</span>
+        <span class="feed-badge">LIVE WEBCAM AI STREAM</span>
       </div>
 
       <div class="video-wrapper">
         <img id="video-feed" class="video-feed" src="" alt="Live feed will appear here">
+
+        <!-- ===================== BROWSER WEBCAM CAPTURE (hidden) =====================
+             These two elements are never shown. The <video> tag receives the live
+             getUserMedia() webcam stream; the <canvas> is used purely to grab still
+             frames from that stream and convert them to JPEG before sending them to
+             the server for YOLOv11 detection. The annotated result the server sends
+             back is what's actually displayed, in the #video-feed <img> above. -->
+        <video id="webcam-video" autoplay playsinline muted style="display:none;"></video>
+        <canvas id="capture-canvas" style="display:none;"></canvas>
+
         <div id="video-placeholder" class="video-placeholder">
           <svg viewBox="0 0 24 24" class="camera-icon">
             <path fill="currentColor" d="M4 5h3l2-2h6l2 2h3a1 1 0 011 1v13a1 1 0 01-1 1H4a1 1 0 01-1-1V6a1 1 0 011-1zm8 3a5 5 0 100 10 5 5 0 000-10zm0 2a3 3 0 110 6 3 3 0 010-6z"/>
           </svg>
           <p>Camera feed is offline</p>
-          <span>Click "Start Camera" to begin live detection</span>
+          <span>Click "Start Camera" and allow camera access to begin live detection</span>
         </div>
         <div class="scan-overlay"></div>
       </div>
@@ -70,8 +80,6 @@
 
     <!-- ---------- RIGHT: SIDE PANEL ---------- -->
     <aside class="side-panel">
-
-    
 
       <div class="stat-card glass-card">
         <div class="stat-icon-wrap detect-icon">

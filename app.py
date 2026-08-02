@@ -1,39 +1,61 @@
 # ============================================================
 # LIVE MOVING OBJECT DETECTION USING YOLOv11 — FLASK WEB APP
+# (CLOUD / RAILWAY VERSION — BROWSER WEBCAM EDITION)
 # ============================================================
-# This file merges TWO existing projects:
+# This file is a CONVERSION of the existing working project, not a
+# rewrite. Everything below is preserved exactly:
 #
-#   PROJECT 1 (preserved exactly): KNN Background Subtraction +
-#   Morphological Filtering + Moving-Region Gating + YOLOv11 +
-#   ByteTrack detection pipeline, CSV logging, screenshot/recording,
-#   professional on-frame overlay (navbar, FPS, date, time, object
-#   panel, resolution, recording indicator).
+#   - KNN Background Subtraction
+#   - Gaussian Blur + Threshold noise removal
+#   - Morphological Open/Close/Dilate
+#   - Moving-region contour detection (area >= 1500)
+#   - YOLOv11 + ByteTrack tracking
+#   - Moving-region membership gating (ignore static objects)
+#   - Object counter, CSV logging (output/detection_log.csv)
+#   - Bounding boxes, track IDs, per-class colors
+#   - Professional overlay: navbar title, FPS, date, time,
+#     moving-object total, REC indicator, transparent object
+#     panel, resolution text
+#   - Screenshot capture (screenshots/)
+#   - Video recording (output/, mp4v)
+#   - Flask REST API (/api/start_camera, /api/stop_camera,
+#     /api/status, /api/screenshot, /api/start_recording,
+#     /api/stop_recording, /api/download_screenshot,
+#     /api/download_recording)
 #
-#   PROJECT 2 (used only for integration): Flask routes, MJPEG
-#   streaming, threading/locking pattern.
+# ONLY CHANGE:
+#   Local machines running this app can use cv2.VideoCapture(0)
+#   because a physical webcam is attached to the server process.
+#   Railway (and any cloud host) runs this app in a headless
+#   container with NO camera device — cv2.VideoCapture(0) would
+#   simply fail there. So instead of the server reading frames
+#   from a local camera in a background thread, the BROWSER reads
+#   frames from the user's webcam (getUserMedia) and POSTs each
+#   frame to a new endpoint:
 #
-# THE ONLY CHANGE MADE TO PROJECT 1's LOGIC:
-#   cv2.imshow(...) / cv2.waitKey(...) desktop display + keyboard
-#   control loop is replaced with Flask MJPEG streaming + REST API
-#   endpoints that toggle the same recording/screenshot behavior.
-#   The detection pipeline itself (KNN -> morphology -> moving
-#   regions -> YOLOv11 -> ByteTrack -> moving-region membership
-#   check -> ignore static objects -> draw boxes/labels/overlay ->
-#   CSV log -> recording write) is untouched and runs in the exact
-#   same order as Project 1.
+#       Browser Webcam -> JavaScript -> POST /api/process_frame
+#           -> [ EXACT SAME DETECTION PIPELINE BELOW ]
+#           -> annotated frame returned as base64 JPEG
+#           -> displayed back in the browser
+#
+#   The detection code itself was only moved from a
+#   "while cap.read(): ..." loop into a "process_frame(frame)"
+#   method that runs the identical steps on whatever frame the
+#   browser sends. No detection/motion logic was altered.
 # ============================================================
 
 import os
 import csv
 import time
+import base64
 import threading
 from datetime import datetime
 from collections import Counter
 
-import cv2 # type: ignore
-import numpy as np # type: ignore
-from flask import Flask, Response, render_template, jsonify, send_file
-from ultralytics import YOLO # type: ignore
+import cv2  # type: ignore
+import numpy as np  # type: ignore
+from flask import Flask, Response, render_template, jsonify, send_file, request
+from ultralytics import YOLO  # type: ignore
 
 # ============================================================
 # APP / PATH CONFIGURATION
@@ -47,7 +69,7 @@ CSV_FILE = os.path.join(OUTPUT_DIR, "detection_log.csv")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
-# CSV header (identical to Project 1)
+# CSV header (identical to the original project)
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, "w", newline="") as file:
         writer = csv.writer(file)
@@ -55,15 +77,21 @@ if not os.path.exists(CSV_FILE):
 
 app = Flask(__name__)
 
+# Browser frames arrive as base64 JPEG in JSON — cap request body
+# size generously (16 MB) so a single high-res frame never gets
+# rejected, while still guarding against abuse.
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+
 
 # ============================================================
 # CAMERA CONTROLLER
 # ------------------------------------------------------------
-# Wraps Project 1's exact detection pipeline inside a background
-# thread so it can feed a Flask MJPEG stream instead of an
-# OpenCV desktop window. No detection/motion logic is altered —
-# only the display + keyboard-control layer is replaced with
-# thread-safe state controlled via Flask API endpoints.
+# Owns the YOLO model, the KNN background subtractor, recording
+# state, screenshot state, and the exact Project-1 detection
+# pipeline. The only structural difference from the local version
+# is that frames are pushed in one at a time via process_frame()
+# instead of being pulled from cv2.VideoCapture(0) inside a
+# dedicated background thread.
 # ============================================================
 class CameraController:
 
@@ -97,15 +125,18 @@ class CameraController:
         # ---------------- SETTINGS ----------------
         self.CONFIDENCE = 0.55
 
-        # ---------------- CAMERA / THREAD STATE ----------------
-        self.cap = None
+        # ---------------- MOTION / DETECTION STATE ----------------
         self.background = None
         self.kernel = np.ones((5, 5), np.uint8)
         self.previous_time = time.time()
 
         self.camera_active = False
-        self.thread = None
-        self.stop_event = threading.Event()
+
+        # Serializes frame processing so browser frames arriving on
+        # concurrent requests are still fed through KNN/YOLO/ByteTrack
+        # one at a time, in order — required because the background
+        # subtractor and the tracker both carry state across frames.
+        self.processing_lock = threading.Lock()
 
         # ---------------- FRAME SHARING (thread-safe) ----------------
         self.latest_frame = None
@@ -127,7 +158,6 @@ class CameraController:
             "fps": 0,
             "total_objects": 0,
             "object_counter": {},
-
             "resolution": "0 x 0",
             "date": "",
             "time": ""
@@ -136,19 +166,19 @@ class CameraController:
     # ------------------------------------------------------------
     # CAMERA START / STOP
     # ------------------------------------------------------------
+    # These no longer open cv2.VideoCapture(0) (no server-side camera
+    # exists in the cloud). They instead arm/disarm the detection
+    # pipeline: start_camera() creates a fresh KNN background
+    # subtractor (exactly as the original did per session) and flips
+    # camera_active on, so that incoming browser frames get processed.
+    # stop_camera() disarms it and finalizes any active recording,
+    # exactly as before.
+    # ------------------------------------------------------------
     def start_camera(self):
         if self.camera_active:
             return True, "Camera already running."
 
-        self.cap = cv2.VideoCapture(0)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-        if not self.cap.isOpened():
-            self.cap = None
-            return False, "Unable to Open Camera"
-
-        # Fresh background subtractor per session (same params as Project 1)
+        # Fresh background subtractor per session (same params as original)
         self.background = cv2.createBackgroundSubtractorKNN(
             history=500,
             dist2Threshold=400,
@@ -157,10 +187,6 @@ class CameraController:
 
         self.previous_time = time.time()
         self.camera_active = True
-        self.stop_event.clear()
-
-        self.thread = threading.Thread(target=self._processing_loop, daemon=True)
-        self.thread.start()
 
         return True, "Camera started successfully."
 
@@ -168,18 +194,10 @@ class CameraController:
         if not self.camera_active:
             return True, "Camera already stopped."
 
-        self.stop_event.set()
         self.camera_active = False
 
         if self.recording:
             self.stop_recording()
-
-        if self.thread:
-            self.thread.join(timeout=2)
-
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
 
         with self.frame_lock:
             self.latest_frame = None
@@ -187,20 +205,20 @@ class CameraController:
         return True, "Camera stopped successfully."
 
     # ------------------------------------------------------------
-    # MAIN PROCESSING LOOP
-    # (Project 1's while-loop body, preserved exactly — only the
-    #  cv2.imshow/cv2.waitKey desktop-display block and keyboard
-    #  handling have been removed, since those are replaced by
-    #  Flask MJPEG streaming and the REST API below.)
+    # PROCESS A SINGLE FRAME FROM THE BROWSER
     # ------------------------------------------------------------
-    def _processing_loop(self):
+    # This is the ORIGINAL while-loop body from Project 1, preserved
+    # step-for-step. The only thing that changed is where "frame"
+    # comes from: previously `success, frame = cap.read()` inside a
+    # local while-loop; now it is decoded from a JPEG the browser
+    # POSTed. Every KNN / morphology / YOLO / ByteTrack / gating /
+    # drawing / overlay / CSV / recording step below is identical.
+    # ------------------------------------------------------------
+    def process_frame(self, frame):
+        if not self.camera_active:
+            return None
 
-        while not self.stop_event.is_set():
-
-            success, frame = self.cap.read()
-
-            if not success:
-                break
+        with self.processing_lock:
 
             frame = cv2.flip(frame, 1)
 
@@ -216,7 +234,8 @@ class CameraController:
 
             current_time = now.strftime("%I:%M:%S %p")
 
-            fps = 1 / (time.time() - self.previous_time)
+            elapsed = time.time() - self.previous_time
+            fps = (1 / elapsed) if elapsed > 0 else 0.0
 
             self.previous_time = time.time()
 
@@ -651,6 +670,8 @@ class CameraController:
             # CONTROLS
             # ============================================================
 
+            # (kept disabled — controls are now buttons in the dashboard,
+            #  same as in the uploaded project's app.py)
             # cv2.putText(
             #     output,
             #     "S = Screenshot | R = Record | Q = Quit",
@@ -678,41 +699,18 @@ class CameraController:
                 self.status["time"] = current_time
 
             # ============================================================
-            # PUBLISH FRAME FOR MJPEG STREAMING
-            # (replaces cv2.imshow("Live Moving Object Detection", output))
+            # PUBLISH FRAME
+            # (replaces cv2.imshow("Live Moving Object Detection", output);
+            #  the annotated frame is now handed back to the caller, which
+            #  is the /api/process_frame route, which returns it to the
+            #  browser to be displayed instead of streaming an MJPEG feed
+            #  read from a local camera device.)
             # ============================================================
 
             with self.frame_lock:
                 self.latest_frame = output
 
-        # ---------------- LOOP ENDED: RELEASE RESOURCES ----------------
-        with self.record_lock:
-            if self.video_writer is not None:
-                self.video_writer.release()
-                self.video_writer = None
-                self.recording = False
-
-    # ------------------------------------------------------------
-    # MJPEG STREAM GENERATOR
-    # ------------------------------------------------------------
-    def generate_mjpeg(self):
-        while self.camera_active:
-            with self.frame_lock:
-                frame = self.latest_frame.copy() if self.latest_frame is not None else None
-
-            if frame is None:
-                time.sleep(0.03)
-                continue
-
-            ok, buffer = cv2.imencode(".jpg", frame)
-            if not ok:
-                continue
-
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
-            )
-            time.sleep(0.03)
+            return output
 
     # ------------------------------------------------------------
     # SCREENSHOT (replaces the 'S' keyboard control)
@@ -820,19 +818,62 @@ camera_controller = CameraController()
 # ============================================================
 @app.route("/")
 def index():
-    """Render the main dashboard page."""
+    """Render the main dashboard page (unchanged design)."""
     return render_template("index.html")
 
 
-@app.route("/video_feed")
-def video_feed():
-    """MJPEG streaming route consumed by the <img> tag on the frontend."""
+# ------------------------------------------------------------
+# NEW ROUTE: BROWSER WEBCAM FRAME PROCESSING
+# ------------------------------------------------------------
+# Receives one JPEG frame (as a base64 data URL) captured by the
+# browser's getUserMedia webcam feed, runs it through the exact
+# detection pipeline in CameraController.process_frame(), and
+# returns the annotated frame back as a base64 data URL so the
+# frontend can paint it into the existing <img id="video-feed">
+# element — preserving the "live feed" look of the dashboard
+# without needing server-side camera access.
+# ------------------------------------------------------------
+@app.route("/api/process_frame", methods=["POST"])
+def api_process_frame():
     if not camera_controller.camera_active:
-        return Response(status=204)
-    return Response(
-        camera_controller.generate_mjpeg(),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
+        return jsonify({"success": False, "message": "Camera is not active."}), 400
+
+    data = request.get_json(silent=True)
+    if not data or "image" not in data:
+        return jsonify({"success": False, "message": "No image data received."}), 400
+
+    try:
+        image_data = data["image"]
+
+        # Strip the "data:image/jpeg;base64," header if present
+        if "," in image_data:
+            image_data = image_data.split(",", 1)[1]
+
+        img_bytes = base64.b64decode(image_data)
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        if frame is None:
+            return jsonify({"success": False, "message": "Invalid image data."}), 400
+
+        output = camera_controller.process_frame(frame)
+
+        if output is None:
+            return jsonify({"success": False, "message": "Camera is not active."}), 400
+
+        ok, buffer = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if not ok:
+            return jsonify({"success": False, "message": "Frame encoding failed."}), 500
+
+        encoded = base64.b64encode(buffer).decode("utf-8")
+
+        return jsonify({
+            "success": True,
+            "image": f"data:image/jpeg;base64,{encoded}"
+        })
+
+    except Exception as exc:
+        return jsonify({"success": False, "message": f"Frame processing error: {exc}"}), 500
 
 
 @app.route("/api/start_camera", methods=["POST"])
@@ -890,14 +931,24 @@ def api_download_recording():
 
 
 # ============================================================
+# HEALTH CHECK (used by Railway's healthcheck)
+# ============================================================
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok"}), 200
+
+
+# ============================================================
 # RUN APP
 # ============================================================
 if __name__ == "__main__":
-    # threaded=True allows concurrent handling of MJPEG stream + status polling
+    # Local dev entrypoint. On Railway, gunicorn (see Procfile) runs
+    # this app instead of this block.
+    port = int(os.environ.get("PORT", 5000))
     app.run(
-    debug=True,
-    use_reloader=False,
-    threaded=True,
-    host="0.0.0.0",
-    port=5000
-)
+        debug=False,
+        use_reloader=False,
+        threaded=True,
+        host="0.0.0.0",
+        port=port
+    )
