@@ -18,13 +18,10 @@
 
 <br/>
 
-```
-> ## 🚀 Smart Motion Detection Pipeline
->
-> **KNN Motion Detection** → **YOLOv11 Detection** → **ByteTrack Tracking** → **Moving Object Filtering** → **Live Dashboard** → **Recording & Screenshot**
->
-> 🎯 **Only moving objects are detected, tracked, counted and logged in real time.**
-```
+<p align="center">
+<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=24&pause=1200&color=00D9FF&center=true&vCenter=true&width=900&lines=Live+Moving+Object+Detection+System;Real-Time+Motion+Detection;YOLOv11+%7C+ByteTrack+%7C+OpenCV;Flask+Dashboard;Railway+Deployment" />
+</p>
+
 
 </div>
 
