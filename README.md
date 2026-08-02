@@ -19,12 +19,11 @@
 <br/>
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                                                                        │
-│     ⚡  KNN Motion Detection  +  YOLOv11  +  ByteTrack  =  🎯          │
-│         ONLY MOVING OBJECTS ARE DETECTED, TRACKED & LOGGED            │
-│                                                                        │
-└──────────────────────────────────────────────────────────────────────┘
+> ## 🚀 Smart Motion Detection Pipeline
+>
+> **KNN Motion Detection** → **YOLOv11 Detection** → **ByteTrack Tracking** → **Moving Object Filtering** → **Live Dashboard** → **Recording & Screenshot**
+>
+> 🎯 **Only moving objects are detected, tracked, counted and logged in real time.**
 ```
 
 </div>
