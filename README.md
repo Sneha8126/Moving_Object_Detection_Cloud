@@ -41,25 +41,11 @@
 
 ### 🌐 Click below to open the live dashboard
 
-# [🔗 YOUR_RAILWAY_LINK](YOUR_RAILWAY_LINK)
+# [🔗https://movingobjectdetectioncloud-production.up.railway.app/]
 
 </td>
 </tr>
 </table>
-
-</div>
-
----
-
-## 🎬 Demo Preview
-
-<div align="center">
-
-> 🖼️ **Insert Demo GIF Here**
->
-> _(Record a short screen capture of the live dashboard detecting moving objects and drop the GIF/MP4 into this section — e.g. `assets/demo.gif`)_
-
-<img src="https://via.placeholder.com/850x420/0d1117/00f6ff?text=%F0%9F%8E%A5+Insert+Demo+GIF+Here" alt="Demo GIF Placeholder" width="850"/>
 
 </div>
 
@@ -456,29 +442,11 @@ Contributions, issues, and feature requests are welcome!
 
 <div align="center">
 
-### **Neetu**
+### **Sneha**
 🎓 *Computer Science & Engineering*
 
 [![GitHub](https://img.shields.io/badge/GitHub-Profile-181717?style=for-the-badge&logo=github)](#)
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2?style=for-the-badge&logo=linkedin)](#)
-
-</div>
-
----
-
-## 📜 License
-
-<div align="center">
-
-This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
-
-```
-MIT License © 2026 Neetu
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files, to deal in the
-Software without restriction, including the rights to use, copy, modify,
-merge, publish, distribute, sublicense, and/or sell copies of the Software.
-```
 
 </div>
 
