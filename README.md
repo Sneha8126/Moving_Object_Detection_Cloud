@@ -345,7 +345,7 @@ gunicorn app:app --workers 1 --threads 8 --timeout 180 --bind 0.0.0.0:$PORT
 ```
 
 5. Once deployed, Railway provides a public HTTPS URL — required for browser webcam access (`getUserMedia`) to work.
-6. Visit the link, click **Start Camera**, allow camera permissions, and detection begins instantly. ✅
+6. Visit the link, click **Start Camera**, allow camera permissions, and detection begins instantly. 
 
 > ⚠️ **Note:** Since the server runs in a headless cloud container with no physical camera, the browser's webcam feed is captured client-side and streamed frame-by-frame to the Flask backend for processing — not read via `cv2.VideoCapture(0)`.
 
