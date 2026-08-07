@@ -41,7 +41,7 @@
 
 ### 🌐 Click below to open the live dashboard
 
-# [🔗(https://movingobjectdetectioncloud-production.up.railway.app)]
+# [🔗https://movingobjectdetectioncloud-production.up.railway.app]
 
 </td>
 </tr>
