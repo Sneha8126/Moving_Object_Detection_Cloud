@@ -11,6 +11,16 @@
    Railway serves the app over HTTPS by default, so camera access will work
    once deployed. On localhost during development it also works over plain
    http://localhost.
+
+   CAMERA SWITCHING NOTE:
+   Camera switching is implemented using navigator.mediaDevices.enumerateDevices()
+   and explicit deviceId targeting (constraint: { exact: deviceId } ), instead of
+   the "facingMode: user/environment" approach. facingMode is unreliable on many
+   Android devices (especially Samsung's browser and multi-lens phones), where it
+   can throw OverconstrainedError / "Could not switch video source" because the
+   browser cannot map the abstract facingMode hint to one of several physical
+   lenses. Enumerating actual videoinput devices and cycling through their
+   concrete deviceIds is the professional, cross-platform-safe approach.
 ============================================================================ */
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -57,12 +67,15 @@ document.addEventListener("DOMContentLoaded", () => {
   let captureTimer      = null;   // setTimeout handle for the capture loop
   let isProcessingFrame = false;  // guards against overlapping in-flight requests
 
-  // ---- Front / rear camera switching state ----
-  // "user" = front-facing camera, "environment" = rear-facing camera.
-  // Always starts on the front camera when Start Camera is pressed, per
-  // the existing default behavior.
-  let currentFacingMode = "user";
-  let isSwitchingCamera = false; // guards against double-clicks mid-switch
+  // ---- Multi-camera (device enumeration) switching state ----
+  // Replaces the old facingMode "user"/"environment" approach, which is
+  // unreliable on many Android devices (notably Samsung's browser and
+  // phones with multiple rear lenses). Instead we enumerate every actual
+  // videoinput device the browser can see and cycle through their real
+  // deviceIds, which is supported consistently across platforms.
+  let videoDevices      = [];     // array of { deviceId, label } videoinput devices
+  let currentDeviceIndex = 0;     // index into videoDevices of the camera in use
+  let isSwitchingCamera  = false; // guards against double-clicks mid-switch
 
   // How often we grab a frame from the webcam and send it to the server.
   // YOLOv11 + KNN + ByteTrack on CPU (Railway has no GPU) needs real time
@@ -99,7 +112,10 @@ document.addEventListener("DOMContentLoaded", () => {
   function setCameraRunningUI(running) {
     btnStartCamera.disabled = running;
     btnStopCamera.disabled = !running;
-    btnSwitchCamera.disabled = !running;
+    // Switch Camera stays disabled whenever the camera isn't running, and is
+    // re-enabled only if the camera IS running AND more than one physical
+    // camera device was found during enumeration (see refreshSwitchButtonUI).
+    btnSwitchCamera.disabled = !running || videoDevices.length <= 1;
     btnScreenshot.disabled = !running;
     btnStartRecording.disabled = !running;
 
@@ -113,6 +129,12 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!running) {
       videoFeed.src = "";
     }
+  }
+
+  // Re-applies the Switch Camera button's enabled/disabled state based on
+  // how many cameras are currently known, without touching any other UI.
+  function refreshSwitchButtonUI() {
+    btnSwitchCamera.disabled = !cameraRunning || videoDevices.length <= 1;
   }
 
   function setRecordingUI(recording) {
@@ -137,6 +159,48 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   /* ============================================================================
+     DEVICE ENUMERATION
+     ------------------------------------------------------------------------
+     Lists every physical camera the browser can see. Device labels are only
+     populated by the browser once camera permission has been granted at
+     least once, so this is called AFTER the first successful getUserMedia()
+     call (both on Start Camera and again defensively before switching).
+  ============================================================================ */
+  async function refreshVideoDevices() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+      videoDevices = [];
+      return;
+    }
+
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      videoDevices = devices.filter((d) => d.kind === "videoinput");
+    } catch (err) {
+      console.error("enumerateDevices failed:", err);
+      videoDevices = [];
+    }
+  }
+
+  // Matches the deviceId actually in use by a live stream's video track
+  // against our enumerated videoDevices list, so currentDeviceIndex stays
+  // accurate even if the browser picked a different default camera than
+  // index 0 (this can happen on some devices/OS camera policies).
+  function syncCurrentDeviceIndex(stream) {
+    if (!stream) return;
+    const track = stream.getVideoTracks()[0];
+    if (!track) return;
+
+    const settings = track.getSettings ? track.getSettings() : {};
+    const activeDeviceId = settings.deviceId;
+    if (!activeDeviceId) return;
+
+    const idx = videoDevices.findIndex((d) => d.deviceId === activeDeviceId);
+    if (idx !== -1) {
+      currentDeviceIndex = idx;
+    }
+  }
+
+  /* ============================================================================
      BROWSER WEBCAM ACCESS
   ============================================================================ */
   async function startWebcam() {
@@ -146,17 +210,34 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     try {
+      // Initial camera request. We don't yet know device IDs (labels are
+      // hidden until permission is granted), so we ask for the default
+      // front-facing camera the same way the browser always has. Once
+      // permission is granted this unlocks enumerateDevices() labels,
+      // which we use for ALL subsequent switching.
       mediaStream = await navigator.mediaDevices.getUserMedia({
         video: {
           width: { ideal: 1280 },
           height: { ideal: 720 },
-          facingMode: currentFacingMode
+          facingMode: { ideal: "user" }
         },
         audio: false
       });
 
       webcamVideo.srcObject = mediaStream;
       await webcamVideo.play();
+
+      // Now that permission is granted, build the real device list and
+      // figure out which physical camera we actually landed on.
+      await refreshVideoDevices();
+      currentDeviceIndex = 0;
+      syncCurrentDeviceIndex(mediaStream);
+
+      if (videoDevices.length <= 1) {
+        showNotification("Only one camera available.", "info");
+      }
+      refreshSwitchButtonUI();
+
       return true;
 
     } catch (err) {
@@ -174,21 +255,26 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   /* ============================================================================
-     SWITCH CAMERA (front <-> rear)
+     SWITCH CAMERA (cycles through every enumerated camera device)
      ------------------------------------------------------------------------
-     Uses the MediaDevices API to open a new stream on the opposite physical
-     camera, then swaps it into the existing hidden <video> element. The
-     capture loop (captureAndSendFrame) keeps running the entire time and
-     simply keeps pulling frames from webcamVideo — since it reads whatever
-     is currently attached, once srcObject is swapped the very next capture
-     tick starts sending frames from the new camera automatically. This
-     means detection, recording, and screenshots all continue working
-     without any interruption or page reload.
+     Uses navigator.mediaDevices.enumerateDevices() results and opens the
+     next physical camera via deviceId: { exact: deviceId } — NOT facingMode.
+     This is far more reliable across Android Chrome, Samsung Browser, Edge,
+     desktop Chrome/laptop webcams, and iPhone Safari, because it targets a
+     concrete hardware device instead of an abstract "front/back" hint that
+     some devices/browsers can't resolve (causing OverconstrainedError /
+     "Could not switch video source").
+
+     The capture loop (captureAndSendFrame) keeps running the entire time
+     and simply keeps pulling frames from webcamVideo — since it reads
+     whatever is currently attached, once srcObject is swapped the very
+     next capture tick starts sending frames from the new camera
+     automatically. This means detection, recording, and screenshots all
+     continue working without any interruption or page reload.
 
      The old stream's tracks are only stopped AFTER the new stream is
-     successfully acquired, so if the switch fails (e.g. no rear camera
-     available on a laptop) the current camera keeps running instead of
-     going dark.
+     successfully acquired, so if the switch fails the current camera
+     keeps running instead of going dark.
   ============================================================================ */
   async function switchCamera() {
     if (!cameraRunning || isSwitchingCamera) return;
@@ -198,17 +284,28 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
+    // Defensive re-enumeration in case devices changed (e.g. a USB webcam
+    // was plugged in) since the camera was started.
+    await refreshVideoDevices();
+
+    if (videoDevices.length <= 1) {
+      showNotification("Only one camera available.", "info");
+      refreshSwitchButtonUI();
+      return;
+    }
+
     isSwitchingCamera = true;
     btnSwitchCamera.disabled = true;
 
-    const targetFacingMode = currentFacingMode === "user" ? "environment" : "user";
+    const nextIndex = (currentDeviceIndex + 1) % videoDevices.length;
+    const nextDevice = videoDevices[nextIndex];
 
     try {
       const newStream = await navigator.mediaDevices.getUserMedia({
         video: {
           width: { ideal: 1280 },
           height: { ideal: 720 },
-          facingMode: { ideal: targetFacingMode }
+          deviceId: { exact: nextDevice.deviceId }
         },
         audio: false
       });
@@ -222,12 +319,13 @@ document.addEventListener("DOMContentLoaded", () => {
       webcamVideo.srcObject = mediaStream;
       await webcamVideo.play();
 
-      currentFacingMode = targetFacingMode;
+      currentDeviceIndex = nextIndex;
+      // Re-sync in case the browser didn't honor the exact deviceId 1:1
+      // (rare, but keeps state consistent if it happens).
+      syncCurrentDeviceIndex(mediaStream);
 
-      showNotification(
-        `Switched to ${targetFacingMode === "user" ? "Front" : "Rear"} Camera`,
-        "success"
-      );
+      const label = nextDevice.label || `Camera ${nextIndex + 1}`;
+      showNotification(`Switched to ${label}`, "success");
 
     } catch (err) {
       showNotification("Camera switch failed: " + err.message, "error");
@@ -235,7 +333,7 @@ document.addEventListener("DOMContentLoaded", () => {
       // on the previous camera uninterrupted.
     } finally {
       isSwitchingCamera = false;
-      btnSwitchCamera.disabled = !cameraRunning;
+      refreshSwitchButtonUI();
     }
   }
 
@@ -294,8 +392,8 @@ document.addEventListener("DOMContentLoaded", () => {
   btnStartCamera.addEventListener("click", async () => {
     btnStartCamera.disabled = true;
 
-    // Always start on the front camera by default.
-    currentFacingMode = "user";
+    // Always start on the default (first/front) camera.
+    currentDeviceIndex = 0;
 
     const webcamReady = await startWebcam();
     if (!webcamReady) {
@@ -327,7 +425,7 @@ document.addEventListener("DOMContentLoaded", () => {
       captureTimer = null;
     }
     stopWebcam();
-    currentFacingMode = "user"; // reset so next Start Camera opens the default camera
+    currentDeviceIndex = 0; // reset so next Start Camera opens the default camera
 
     setCameraRunningUI(false);
     setRecordingUI(false);
@@ -416,7 +514,7 @@ document.addEventListener("DOMContentLoaded", () => {
           captureTimer = null;
         }
         stopWebcam();
-        currentFacingMode = "user";
+        currentDeviceIndex = 0;
         setCameraRunningUI(false);
         stopStatusPolling();
       }
