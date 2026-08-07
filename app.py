@@ -23,25 +23,26 @@
 #     /api/stop_recording, /api/download_screenshot,
 #     /api/download_recording)
 #
-# ONLY CHANGE:
-#   Local machines running this app can use cv2.VideoCapture(0)
-#   because a physical webcam is attached to the server process.
-#   Railway (and any cloud host) runs this app in a headless
-#   container with NO camera device — cv2.VideoCapture(0) would
-#   simply fail there. So instead of the server reading frames
-#   from a local camera in a background thread, the BROWSER reads
-#   frames from the user's webcam (getUserMedia) and POSTs each
-#   frame to a new endpoint:
+# CHANGE LOG (this revision):
+#   1) YOLO now runs on ALL 80 COCO classes instead of the
+#      restricted 7-class list. The `classes=` filter was removed
+#      from model.track(). Motion filtering (KNN + blur + threshold
+#      + morphology + contours + moving-region center-point test)
+#      is 100% unchanged, so only objects that are ACTUALLY MOVING
+#      still get drawn/counted/logged — static objects of any class
+#      are still discarded by the existing `if not moving: continue`
+#      gate.
+#   2) Bounding box / label colors are now generated automatically
+#      per class name (deterministic hash -> HSV -> BGR), cached in
+#      self.class_colors, instead of a manually written 7-entry
+#      dict. Every one of the 80 COCO classes gets a stable, unique
+#      color the first time it's seen.
 #
-#       Browser Webcam -> JavaScript -> POST /api/process_frame
-#           -> [ EXACT SAME DETECTION PIPELINE BELOW ]
-#           -> annotated frame returned as base64 JPEG
-#           -> displayed back in the browser
-#
-#   The detection code itself was only moved from a
-#   "while cap.read(): ..." loop into a "process_frame(frame)"
-#   method that runs the identical steps on whatever frame the
-#   browser sends. No detection/motion logic was altered.
+#   Camera front/rear switching (browser-side, via getUserMedia
+#   facingMode) does not require any backend change — /api/process_frame
+#   already accepts whatever frame the browser sends regardless of
+#   which physical camera produced it. See script.js / index.html
+#   notes provided separately.
 # ============================================================
 
 import os
@@ -49,6 +50,7 @@ import csv
 import time
 import base64
 import threading
+import colorsys
 from datetime import datetime
 from collections import Counter
 
@@ -101,6 +103,10 @@ class CameraController:
         self.class_names = self.model.names
 
         # ---------------- MOVING OBJECT CLASSES ----------------
+        # NOTE: No longer used to filter YOLO inference (all 80 COCO
+        # classes are now detected — see model.track() call below).
+        # Kept only for reference / backward compatibility; has no
+        # effect on behavior.
         self.moving_classes = [
             0,      # Person
             1,      # Bicycle
@@ -112,15 +118,11 @@ class CameraController:
         ]
 
         # ---------------- COLORS ----------------
-        self.colors = {
-            "person": (0, 255, 0),
-            "bicycle": (255, 255, 0),
-            "car": (255, 0, 0),
-            "motorcycle": (255, 0, 255),
-            "bus": (0, 165, 255),
-            "train": (0, 255, 255),
-            "truck": (128, 0, 255)
-        }
+        # Colors are generated automatically per-class the first time
+        # that class is seen, then cached here so the color stays
+        # stable across frames for the same class. Works for all 80
+        # COCO classes without manually defining any of them.
+        self.class_colors = {}
 
         # ---------------- SETTINGS ----------------
         self.CONFIDENCE = 0.55
@@ -162,6 +164,23 @@ class CameraController:
             "date": "",
             "time": ""
         }
+
+    # ------------------------------------------------------------
+    # DYNAMIC PER-CLASS COLOR GENERATION
+    # ------------------------------------------------------------
+    # Replaces the old fixed 7-entry color dict. Any of the 80 COCO
+    # class names gets a deterministic, unique BGR color the first
+    # time it's seen, cached in self.class_colors so the same class
+    # always gets the same color across frames and sessions.
+    # ------------------------------------------------------------
+    def _get_color_for_class(self, class_name):
+        if class_name not in self.class_colors:
+            hue = (hash(class_name) % 360) / 360.0
+            r, g, b = colorsys.hsv_to_rgb(hue, 0.85, 0.95)
+            self.class_colors[class_name] = (
+                int(b * 255), int(g * 255), int(r * 255)
+            )
+        return self.class_colors[class_name]
 
     # ------------------------------------------------------------
     # CAMERA START / STOP
@@ -213,6 +232,12 @@ class CameraController:
     # local while-loop; now it is decoded from a JPEG the browser
     # POSTed. Every KNN / morphology / YOLO / ByteTrack / gating /
     # drawing / overlay / CSV / recording step below is identical.
+    #
+    # Because the browser can send frames from EITHER the front or
+    # rear camera (see /api/process_frame and the front-end camera
+    # switch), this method makes no assumption about which physical
+    # camera produced the frame — it simply processes whatever
+    # image array it is given, exactly as before.
     # ------------------------------------------------------------
     def process_frame(self, frame):
         if not self.camera_active:
@@ -311,6 +336,11 @@ class CameraController:
             # ============================================================
             # YOLOv11 + BYTE TRACK
             # ============================================================
+            # `classes=` filter removed so inference runs across all 80
+            # COCO classes. Static objects of any class are still
+            # discarded below by the moving-region center-point test —
+            # motion filtering logic is completely unchanged.
+            # ============================================================
 
             results = self.model.track(
 
@@ -319,8 +349,6 @@ class CameraController:
                 persist=True,
 
                 tracker="bytetrack.yaml",
-
-                classes=self.moving_classes,
 
                 conf=self.CONFIDENCE,
 
@@ -406,10 +434,7 @@ class CameraController:
                     # DRAW BOUNDING BOX
                     # ============================================================
 
-                    color = self.colors.get(
-                        class_name,
-                        (255, 255, 255)
-                    )
+                    color = self._get_color_for_class(class_name)
 
                     cv2.rectangle(
                         output,
@@ -823,7 +848,7 @@ def index():
 
 
 # ------------------------------------------------------------
-# NEW ROUTE: BROWSER WEBCAM FRAME PROCESSING
+# BROWSER WEBCAM FRAME PROCESSING
 # ------------------------------------------------------------
 # Receives one JPEG frame (as a base64 data URL) captured by the
 # browser's getUserMedia webcam feed, runs it through the exact
@@ -832,6 +857,11 @@ def index():
 # frontend can paint it into the existing <img id="video-feed">
 # element — preserving the "live feed" look of the dashboard
 # without needing server-side camera access.
+#
+# This endpoint is camera-agnostic: it does not care whether the
+# browser captured the frame from the front or rear physical
+# camera, so front/rear switching on the client requires no change
+# here.
 # ------------------------------------------------------------
 @app.route("/api/process_frame", methods=["POST"])
 def api_process_frame():

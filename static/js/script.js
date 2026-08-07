@@ -5,7 +5,7 @@
    getUserMedia + canvas, POSTing frames to /api/process_frame, painting the
    annotated frame returned by the server back into the dashboard, status
    polling, screenshots, recording, downloads, notifications, loading
-   animation.
+   animation, and front/rear camera switching.
 
    NOTE: getUserMedia() requires a secure context (HTTPS or localhost).
    Railway serves the app over HTTPS by default, so camera access will work
@@ -42,6 +42,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const btnStartCamera        = document.getElementById("btn-start-camera");
   const btnStopCamera         = document.getElementById("btn-stop-camera");
+  const btnSwitchCamera       = document.getElementById("btn-switch-camera");
   const btnScreenshot         = document.getElementById("btn-screenshot");
   const btnStartRecording     = document.getElementById("btn-start-recording");
   const btnStopRecording      = document.getElementById("btn-stop-recording");
@@ -55,6 +56,13 @@ document.addEventListener("DOMContentLoaded", () => {
   let cameraRunning     = false;  // true once both webcam + server pipeline are armed
   let captureTimer      = null;   // setTimeout handle for the capture loop
   let isProcessingFrame = false;  // guards against overlapping in-flight requests
+
+  // ---- Front / rear camera switching state ----
+  // "user" = front-facing camera, "environment" = rear-facing camera.
+  // Always starts on the front camera when Start Camera is pressed, per
+  // the existing default behavior.
+  let currentFacingMode = "user";
+  let isSwitchingCamera = false; // guards against double-clicks mid-switch
 
   // How often we grab a frame from the webcam and send it to the server.
   // YOLOv11 + KNN + ByteTrack on CPU (Railway has no GPU) needs real time
@@ -91,6 +99,7 @@ document.addEventListener("DOMContentLoaded", () => {
   function setCameraRunningUI(running) {
     btnStartCamera.disabled = running;
     btnStopCamera.disabled = !running;
+    btnSwitchCamera.disabled = !running;
     btnScreenshot.disabled = !running;
     btnStartRecording.disabled = !running;
 
@@ -141,7 +150,7 @@ document.addEventListener("DOMContentLoaded", () => {
         video: {
           width: { ideal: 1280 },
           height: { ideal: 720 },
-          facingMode: "user"
+          facingMode: currentFacingMode
         },
         audio: false
       });
@@ -162,6 +171,72 @@ document.addEventListener("DOMContentLoaded", () => {
       mediaStream = null;
     }
     webcamVideo.srcObject = null;
+  }
+
+  /* ============================================================================
+     SWITCH CAMERA (front <-> rear)
+     ------------------------------------------------------------------------
+     Uses the MediaDevices API to open a new stream on the opposite physical
+     camera, then swaps it into the existing hidden <video> element. The
+     capture loop (captureAndSendFrame) keeps running the entire time and
+     simply keeps pulling frames from webcamVideo — since it reads whatever
+     is currently attached, once srcObject is swapped the very next capture
+     tick starts sending frames from the new camera automatically. This
+     means detection, recording, and screenshots all continue working
+     without any interruption or page reload.
+
+     The old stream's tracks are only stopped AFTER the new stream is
+     successfully acquired, so if the switch fails (e.g. no rear camera
+     available on a laptop) the current camera keeps running instead of
+     going dark.
+  ============================================================================ */
+  async function switchCamera() {
+    if (!cameraRunning || isSwitchingCamera) return;
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showNotification("This browser does not support camera switching.", "error");
+      return;
+    }
+
+    isSwitchingCamera = true;
+    btnSwitchCamera.disabled = true;
+
+    const targetFacingMode = currentFacingMode === "user" ? "environment" : "user";
+
+    try {
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: { ideal: targetFacingMode }
+        },
+        audio: false
+      });
+
+      // Stop the previous MediaStream only now that the new one is ready.
+      if (mediaStream) {
+        mediaStream.getTracks().forEach((track) => track.stop());
+      }
+
+      mediaStream = newStream;
+      webcamVideo.srcObject = mediaStream;
+      await webcamVideo.play();
+
+      currentFacingMode = targetFacingMode;
+
+      showNotification(
+        `Switched to ${targetFacingMode === "user" ? "Front" : "Rear"} Camera`,
+        "success"
+      );
+
+    } catch (err) {
+      showNotification("Camera switch failed: " + err.message, "error");
+      // Old stream (if any) was never stopped, so detection keeps running
+      // on the previous camera uninterrupted.
+    } finally {
+      isSwitchingCamera = false;
+      btnSwitchCamera.disabled = !cameraRunning;
+    }
   }
 
   /* ============================================================================
@@ -219,6 +294,9 @@ document.addEventListener("DOMContentLoaded", () => {
   btnStartCamera.addEventListener("click", async () => {
     btnStartCamera.disabled = true;
 
+    // Always start on the front camera by default.
+    currentFacingMode = "user";
+
     const webcamReady = await startWebcam();
     if (!webcamReady) {
       btnStartCamera.disabled = false;
@@ -249,6 +327,7 @@ document.addEventListener("DOMContentLoaded", () => {
       captureTimer = null;
     }
     stopWebcam();
+    currentFacingMode = "user"; // reset so next Start Camera opens the default camera
 
     setCameraRunningUI(false);
     setRecordingUI(false);
@@ -256,6 +335,9 @@ document.addEventListener("DOMContentLoaded", () => {
     showNotification(data.message, data.success ? "success" : "error");
     resetStats();
   });
+
+  /* ---- SWITCH CAMERA ---- */
+  btnSwitchCamera.addEventListener("click", switchCamera);
 
   /* ---- SCREENSHOT ---- */
   btnScreenshot.addEventListener("click", async () => {
@@ -334,6 +416,7 @@ document.addEventListener("DOMContentLoaded", () => {
           captureTimer = null;
         }
         stopWebcam();
+        currentFacingMode = "user";
         setCameraRunningUI(false);
         stopStatusPolling();
       }
